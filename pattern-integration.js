@@ -1,0 +1,950 @@
+/* ══════════════════════════════════════════════════════════════════════════
+   Pattern Intelligence Integration — StoX
+   Wires PatternStore, BatchBacktest, PatternScoring, MLTrainer, and
+   PatternDashboard into the main app-core.js navigation and scoring pipeline.
+
+   This file should be loaded AFTER app-core.js and patches the app at runtime.
+
+   Dependencies: React, window.PatternStore, window.BatchBacktest,
+               window.PatternScoring, window.MLTrainer, window.PatternDashboard
+   ══════════════════════════════════════════════════════════════════════════ */
+
+(function () {
+  "use strict";
+
+  var INITIALIZED = false;
+
+  /* ── In-memory pattern cache for synchronous screener access ─────────── */
+  var _patternMemoryCache = {};   // { "RELIANCE": patternObj, ... }
+  var _cacheLoaded = false;
+  var _cachedMLModel = null;     // Pre-loaded ML model for synchronous prediction
+  var _cachedScoringConfig = { usePatternWeights: true, useMLBlend: true };
+
+  /* ═══════════════════════════════════════════════════════════════════════
+     Adaptive-threshold support. Two global helpers:
+       __stoxRecordScore(score)  — buffered, debounced push into
+                                    SCORE_CONFIG.adaptiveThresholds.scoreHistory
+       __stoxClassifyLive(score) — classify using percentile cutoffs when
+                                    enabled + >= 30 samples; fixed otherwise.
+     Both are on window so app-core.js::relabelDecision and pattern-scoring.js
+     can share the same logic — one source of truth for the live path.
+     ═══════════════════════════════════════════════════════════════════════ */
+  var _scoreBuf = [];
+  var _scoreFlushTimer = null;
+
+  function _flushScoreBuf() {
+    if (_scoreBuf.length === 0) return;
+    try {
+      var TI = window.TechIndicators;
+      if (!TI || !TI.getScoreConfig) { _scoreBuf.length = 0; return; }
+      var cfg = TI.getScoreConfig();
+      var at = cfg.adaptiveThresholds;
+      if (!at || !at.enabled) { _scoreBuf.length = 0; return; }
+      var existing = Array.isArray(at.scoreHistory) ? at.scoreHistory : [];
+      var hist = existing.concat(_scoreBuf);
+      var cap = at.historyCap || 500;
+      if (hist.length > cap) hist = hist.slice(-cap);
+      _scoreBuf.length = 0;
+      TI.setScoreConfig({ adaptiveThresholds: { scoreHistory: hist } });
+      try { localStorage.setItem("stox_score_config", JSON.stringify(TI.getScoreConfig())); } catch (e) {}
+    } catch (e) { _scoreBuf.length = 0; }
+  }
+
+  window.__stoxRecordScore = function (score) {
+    if (score == null || isNaN(score)) return;
+    try {
+      var TI = window.TechIndicators;
+      var cfg = TI && TI.getScoreConfig ? TI.getScoreConfig() : null;
+      if (!cfg || !cfg.adaptiveThresholds || !cfg.adaptiveThresholds.enabled) return;
+    } catch (e) { return; }
+    _scoreBuf.push(Math.round(score * 10) / 10);
+    if (_scoreBuf.length >= 20) { clearTimeout(_scoreFlushTimer); _flushScoreBuf(); return; }
+    clearTimeout(_scoreFlushTimer);
+    _scoreFlushTimer = setTimeout(_flushScoreBuf, 5000);
+  };
+
+  try {
+    document.addEventListener("visibilitychange", function () {
+      if (document.visibilityState === "hidden") _flushScoreBuf();
+    });
+    window.addEventListener("beforeunload", _flushScoreBuf);
+  } catch (e) {}
+
+  window.__stoxClassifyLive = function (score) {
+    if (score == null) return null;
+    try {
+      var TI = window.TechIndicators;
+      if (!TI || !TI.getScoreConfig) return "NEUTRAL";
+      var cfg = TI.getScoreConfig();
+      var t = cfg.classification || {};
+      var at = cfg.adaptiveThresholds;
+      if (at && at.enabled && window.StoxStats) {
+        var hist = Array.isArray(at.scoreHistory) ? at.scoreHistory : [];
+        if (hist.length >= 30) {
+          var sb = window.StoxStats.adaptiveThreshold(hist, t.strongBuy, 80);
+          var b = window.StoxStats.adaptiveThreshold(hist, t.buy, 65);
+          var wl = window.StoxStats.adaptiveThreshold(hist, t.watchlist, 50);
+          var n = window.StoxStats.adaptiveThreshold(hist, t.neutral, 25);
+          if (score >= sb) return "STRONG_BUY";
+          if (score >= b) return "BUY";
+          if (score >= wl) return "WATCHLIST";
+          if (score >= n) return "NEUTRAL";
+          return "AVOID";
+        }
+      }
+      if (score >= (t.strongBuy != null ? t.strongBuy : 62)) return "STRONG_BUY";
+      if (score >= (t.buy != null ? t.buy : 60)) return "BUY";
+      if (score >= (t.watchlist != null ? t.watchlist : 58)) return "WATCHLIST";
+      if (score >= (t.neutral != null ? t.neutral : 34)) return "NEUTRAL";
+      return "AVOID";
+    } catch (e) { return "NEUTRAL"; }
+  };
+
+  /**
+   * Load all patterns from IndexedDB into memory so the screener can
+   * access them synchronously (no async IDB reads per stock).
+   */
+  async function loadPatternCache() {
+    if (!window.PatternStore) return;
+    try {
+      var patterns = await window.PatternStore.getAll();
+      _patternMemoryCache = {};
+      patterns.forEach(function (p) {
+        if (p && p.symbol) _patternMemoryCache[p.symbol] = p;
+      });
+      _cacheLoaded = true;
+      console.log("[PatternIntel] Pattern cache loaded: " + patterns.length + " stocks in memory");
+    } catch (e) {
+      console.warn("[PatternIntel] Failed to load pattern cache:", e.message);
+    }
+  }
+
+  /**
+   * Get a pattern from memory cache (synchronous).
+   */
+  function getPatternFromCache(symbol) {
+    if (!_cacheLoaded) return null;
+    // Try exact match first, then with/without .NS/.BO suffix
+    var p = _patternMemoryCache[symbol];
+    if (p) return p;
+    if (symbol && !symbol.endsWith(".NS") && !symbol.endsWith(".BO")) {
+      p = _patternMemoryCache[symbol + ".NS"] || _patternMemoryCache[symbol + ".BO"];
+    } else if (symbol) {
+      var base = symbol.replace(/\.NS$/, "").replace(/\.BO$/, "");
+      p = _patternMemoryCache[base] || null;
+    }
+    return p;
+  }
+
+  /**
+   * Public API to reload the cache (call after batch backtest).
+   */
+  window.reloadPatternCache = async function () {
+    await loadPatternCache();
+    // Load scoring config (pattern weights / ML blend toggles)
+    if (window.PatternStore && window.PatternStore.getMeta) {
+      try {
+        var sc = await window.PatternStore.getMeta("scoring_config");
+        if (sc && typeof sc === "object") {
+          _cachedScoringConfig = { usePatternWeights: sc.usePatternWeights !== false, useMLBlend: sc.useMLBlend !== false };
+        }
+      } catch (e) {}
+    }
+    // Update exposed diagnostics
+    if (window.TechIndicators) {
+      window.TechIndicators._patCacheLoaded = _cacheLoaded;
+      window.TechIndicators._patCacheCount = Object.keys(_patternMemoryCache).length;
+      window.TechIndicators._patCacheSymbols = Object.keys(_patternMemoryCache);
+    }
+    console.log("[PatternIntel] Cache reloaded: " + Object.keys(_patternMemoryCache).length + " patterns");
+  };
+
+  /**
+   * Set scoring config toggles (pattern weights / ML blend).
+   * Persists to PatternStore and updates in-memory cache.
+   */
+  window.setScoringConfig = async function (sc) {
+    _cachedScoringConfig = { usePatternWeights: sc.usePatternWeights !== false, useMLBlend: sc.useMLBlend !== false };
+    if (window.PatternStore && window.PatternStore.setMeta) {
+      try { await window.PatternStore.setMeta("scoring_config", _cachedScoringConfig); } catch (e) {}
+    }
+  };
+
+  /**
+   * Get current scoring config toggles (sync).
+   */
+  window.getScoringConfig = function () {
+    return { usePatternWeights: _cachedScoringConfig.usePatternWeights, useMLBlend: _cachedScoringConfig.useMLBlend };
+  };
+
+  /**
+   * Pre-load ML champion model into memory for synchronous screener prediction.
+   */
+  async function preloadMLModel() {
+    _cachedMLModel = null;
+    if (!window.MLTrainer || !window.PatternStore) return;
+    try {
+      var champ = await window.PatternStore.getMeta("ml_model_champion");
+      if (champ && champ.network && champ.normalizer) {
+        _cachedMLModel = champ;
+        console.log("[PatternIntel] ML champion model pre-loaded for synchronous screener prediction");
+      }
+    } catch (e) {
+      console.warn("[PatternIntel] Failed to pre-load ML model:", e.message);
+    }
+  }
+
+  /**
+   * Compute ML features for synchronous prediction.
+   * When dailyCandles is provided, computes real expanded features
+   * (Phase 3/4) so the feature vector matches FEATURE_KEYS length exactly —
+   * predictSync rejects shorter inputs. Otherwise falls back to neutral
+   * defaults (entry_score + pillars only).
+   * @param {Object} compatResult - compat entry-score result
+   * @param {Array} dailyCandles - daily OHLCV
+   * @param {Object} opts - { symbol, indexFeatures } (indexFeatures optional;
+   *        when absent, bull_bear/market_momentum default to neutral 0, which
+   *        matches the training distribution for index-less samples).
+   */
+  function computeMLFeaturesFromCompat(compatResult, dailyCandles, opts) {
+    opts = opts || {};
+    var symbol = opts.symbol || (compatResult && (compatResult.symbol || compatResult.tk)) || null;
+    var indexFeatures = opts.indexFeatures || null;
+    if (!compatResult) return null;
+    /* Un-collapsed pillar features: feed the raw aggregate pillar scores
+       (0..pillarMax) so training and inference see the same per-pillar signal. */
+    var pillarScores = {
+      trendHealth: compatResult.aggTrendHealth != null ? compatResult.aggTrendHealth : 0,
+      pullbackQuality: compatResult.aggPullbackQuality != null ? compatResult.aggPullbackQuality : 0,
+      swingPotential: compatResult.aggSwingPotential != null ? compatResult.aggSwingPotential : 0,
+      breakoutContinuation: compatResult.aggBreakoutContinuation != null ? compatResult.aggBreakoutContinuation : 0,
+      regimeAlignment: compatResult.aggRegimeAlignment != null ? compatResult.aggRegimeAlignment : 0
+    };
+    if (dailyCandles && dailyCandles.length >= 30 && window.TechIndicators) {
+      try {
+        var TI = window.TechIndicators;
+        var n = dailyCandles.length - 1;
+        var feats = TI.computeExpandedFeatures(dailyCandles, n, compatResult.finalScore || 0, symbol, indexFeatures, pillarScores);
+        // Guard: ensure every FEATURE_KEYS key is present with a neutral default,
+        // regardless of which code path produced the object.
+        var keys = ["rsi", "atr_pct", "bb_position", "volume_ratio", "macd_hist", "ema_slope", "adx", "entry_score",
+          "trendHealth", "pullbackQuality", "swingPotential", "breakoutContinuation", "regimeAlignment",
+          "trend_structure", "price_vs_sma200", "ema20_50_cross", "volatility_regime", "mfi", "vol_price_trend",
+          "bull_bear", "market_momentum", "cap_tier", "rsi_regime"];
+        var defaults = { rsi: 50, atr_pct: 0, bb_position: 0.5, volume_ratio: 1, macd_hist: 0, ema_slope: 0, adx: 20, entry_score: compatResult.finalScore || 0, trendHealth: pillarScores.trendHealth, pullbackQuality: pillarScores.pullbackQuality, swingPotential: pillarScores.swingPotential, breakoutContinuation: pillarScores.breakoutContinuation, regimeAlignment: pillarScores.regimeAlignment, trend_structure: 0, price_vs_sma200: -1, ema20_50_cross: 0, volatility_regime: 0, mfi: 50, vol_price_trend: 0, bull_bear: 0, market_momentum: 0, cap_tier: -1, rsi_regime: 0 };
+        var out = {};
+        for (var i = 0; i < keys.length; i++) {
+          var k = keys[i];
+          var v = feats != null ? feats[k] : undefined;
+          out[k] = v != null && isFinite(v) ? v : defaults[k];
+        }
+        out.entry_score = compatResult.finalScore || 0;
+        return out;
+      } catch (e) { /* fall through to defaults */ }
+    }
+    return {
+      rsi: 50, macd_hist: 0, bb_position: 0.5, atr_pct: 0,
+      adx: 20, ema_slope: 0, volume_ratio: 1,
+      trendHealth: pillarScores.trendHealth, pullbackQuality: pillarScores.pullbackQuality,
+      swingPotential: pillarScores.swingPotential,
+      breakoutContinuation: pillarScores.breakoutContinuation,
+      regimeAlignment: pillarScores.regimeAlignment,
+      trend_structure: 0, price_vs_sma200: -1, ema20_50_cross: 0,
+      volatility_regime: 0, mfi: 50, vol_price_trend: 0,
+      bull_bear: 0, market_momentum: 0, cap_tier: -1, rsi_regime: 0,
+      entry_score: compatResult.finalScore || 0
+    };
+  }
+
+  /* ── Synchronous pattern weight application ─────────────────────────── */
+
+  function round2(v) { return v != null ? Math.round(v * 100) / 100 : null; }
+  function round3(v) { return v != null ? Math.round(v * 1000) / 1000 : null; }
+  function clamp(v, lo, hi) { return v < lo ? lo : v > hi ? hi : v; }
+
+  /**
+   * Effective weights for a pattern: manual overrides (Pattern Lab →
+   * Pattern Settings) take precedence; otherwise resolved (repaired from
+   * powers if the stored weights are uniform) and blended toward equal 25%
+   * per the global Learned-weight blend setting. Falls back to stored
+   * weights if PatternScoring is unavailable.
+   */
+  function resolveWeightsForDisplay(pattern) {
+    var w = pattern && pattern.indicatorWeights ? pattern.indicatorWeights : null;
+    try {
+      if (window.PatternStore && window.PatternStore.getWeightOverridesSync) {
+        var ov = window.PatternStore.getWeightOverridesSync();
+        if (ov && pattern.symbol) {
+          var sym = pattern.symbol;
+          var ovW = ov[sym] || ov[sym + ".NS"] || ov[sym + ".BO"];
+          if (ovW) return ovW;
+        }
+      }
+    } catch (e) {}
+    try {
+      if (window.PatternScoring && window.PatternScoring.resolveLearnedWeights) {
+        var rlw = window.PatternScoring.resolveLearnedWeights(pattern);
+        if (rlw) w = rlw;
+      }
+    } catch (e) {}
+    return w;
+  }
+
+  /**
+   * Apply pattern weights to the compat result format.
+   * NOTE: This is the sync path used by the screener (from cache).
+   * The async path used by PatternScoring.compute() is in pattern-scoring.js.
+   * Both check _patternApplied to prevent double ML application.
+   */
+  function applyPatternToCompatResult(compatResult, pattern, dailyCandles) {
+    if (!compatResult || !pattern || !pattern.indicatorWeights) return compatResult;
+
+    var weights = resolveWeightsForDisplay(pattern);
+    var powers = pattern.indicatorPowers;
+
+    var pillars = {
+      trendHealth: compatResult.aggTrendHealth != null ? compatResult.aggTrendHealth : 0,
+      pullbackQuality: compatResult.aggPullbackQuality != null ? compatResult.aggPullbackQuality : 0,
+      swingPotential: compatResult.aggSwingPotential != null ? compatResult.aggSwingPotential : 0,
+      breakoutContinuation: compatResult.aggBreakoutContinuation != null ? compatResult.aggBreakoutContinuation : 0,
+      regimeAlignment: compatResult.aggRegimeAlignment != null ? compatResult.aggRegimeAlignment : 0
+    };
+
+    var pillarMax = { trendHealth: 28, pullbackQuality: 28, swingPotential: 12, breakoutContinuation: 22, regimeAlignment: 4 };
+    if (window.TechIndicators && window.TechIndicators.getScoreConfig) {
+      var sc = window.TechIndicators.getScoreConfig();
+      if (sc && sc.pillarMax) pillarMax = sc.pillarMax;
+    }
+
+    // Uniform weights == no re-weighting: the pattern stage is an identity,
+    // i.e. equal pillars keep the base score exactly (P±Δ = 0). Without this,
+    // the normalized-average scale (0-100) diverges from the base raw-sum
+    // scale (28/28/24/8/6 maxes + modifiers) and fabricates a delta.
+    var firstW = null;
+    var uniformW = true;
+    if (_cachedScoringConfig.usePatternWeights) {
+      ["trendHealth", "pullbackQuality", "swingPotential", "breakoutContinuation", "regimeAlignment"].forEach(function (p) {
+        var w = weights[p] != null ? weights[p] : 0.20;
+        if (firstW == null) firstW = w;
+        else if (Math.abs(w - firstW) > 0.001) uniformW = false;
+      });
+    }
+
+    var totalWeighted = 0;
+    var totalWeight = 0;
+    var powerBonusTotal = 0;
+    var pillarBonuses = {};
+
+    if (uniformW) {
+      // Keep the base score; skip the recompute and power bonus entirely.
+    } else {
+      ["trendHealth", "pullbackQuality", "swingPotential", "breakoutContinuation", "regimeAlignment"].forEach(function (p) {
+        var w = weights[p] != null ? weights[p] : 0.20;
+        var max = pillarMax[p] || 24;
+        var normalizedPillar = clamp(pillars[p] / max, 0, 1);
+        var weighted = normalizedPillar * w;
+        totalWeighted += weighted;
+        totalWeight += w;
+
+        var pb = 0;
+        if (powers && powers[p] && powers[p].infoValue > 0.05 && normalizedPillar > 0.5) {
+          pb = round3(powers[p].infoValue * normalizedPillar * 2);
+        }
+        pillarBonuses[p] = pb;
+        powerBonusTotal += pb;
+      });
+    }
+
+    var baseWeightedScore = uniformW ? compatResult.finalScore : (totalWeight > 0 ? (totalWeighted / totalWeight) * 100 : compatResult.finalScore);
+    var adjustedScore = clamp(round2(baseWeightedScore + powerBonusTotal), 0, 100);
+
+    // ── ML Enhancement (synchronous, using pre-loaded model) ──
+    // Skip ML blend only when disabled by the user.
+    var mlPrediction = null;
+    if (_cachedScoringConfig.useMLBlend && _cachedMLModel && window.MLTrainer && window.MLTrainer.predictSync) {
+      try {
+        var mlFeatures = computeMLFeaturesFromCompat(compatResult, dailyCandles, { symbol: pattern.symbol || compatResult.tk });
+        // Gate: model was trained on entry scores >= entryScoreMin (scores of
+        // actual opened trades). Below that, fall back to pattern-weighted only.
+        if (_cachedMLModel.entryScoreMin != null && (mlFeatures.entry_score == null || mlFeatures.entry_score < _cachedMLModel.entryScoreMin)) {
+          mlPrediction = null;
+        } else {
+          mlPrediction = window.MLTrainer.predictSync(mlFeatures, _cachedMLModel);
+        }
+        if (mlPrediction && mlPrediction.winProbability != null) {
+          var mlScore = mlPrediction.winProbability * 100;
+          // Blend: 75% pattern-weighted + 25% ML (kept modest while model is weak)
+          var mlWeight = 0.25;
+          if (mlPrediction.winProbability >= 0.7 || mlPrediction.winProbability <= 0.3) {
+            mlWeight = 0.35;
+          }
+          adjustedScore = clamp(round2(adjustedScore * (1 - mlWeight) + mlScore * mlWeight), 0, 100);
+        }
+      } catch (mlErr) {
+        // ML prediction failed silently — use pattern-weighted score
+        compatResult._mlSwallowErr = String((mlErr && mlErr.message) || mlErr);
+      }
+    }
+
+    var delta = round2(adjustedScore - compatResult.finalScore);
+
+    var classification = compatResult.decision;
+    if (window.BacktestEngine && window.BacktestEngine.classifyScore) {
+      classification = window.BacktestEngine.classifyScore(adjustedScore);
+    }
+    /* Live adaptive classifier — single source of truth for the sync path.
+       Falls through to fixed thresholds when the feature is off or history
+       is < 30 samples, so enabling is a zero-risk switch. */
+    try { if (window.__stoxClassifyLive) classification = window.__stoxClassifyLive(adjustedScore); } catch (_adE) {}
+    /* Classification always follows the user's configured thresholds.
+       (The old hardcoded "ML rec STRONG_BUY + score>=60 → STRONG_BUY" override
+       bypassed Score Configuration and was removed.) */
+
+    var SCREENER_DECISION_MAP = {
+      STRONG_BUY: { label: "STRONG BUY", color: "#16a34a" },
+      BUY:        { label: "BUY",        color: "#22c55e" },
+      WATCHLIST:  { label: "WATCHLIST",  color: "#f59e0b" },
+      NEUTRAL:    { label: "NEUTRAL",    color: "#6b7280" },
+      AVOID:      { label: "AVOID",      color: "#ef4444" },
+      STRONG_AVOID: { label: "STRONG AVOID", color: "#dc2626" }
+    };
+
+    compatResult._patternApplied = true;
+    compatResult._patternOriginalScore = compatResult.finalScore;
+    compatResult._patternDelta = delta;
+    compatResult.finalScore = adjustedScore;
+    var decisionObj = SCREENER_DECISION_MAP[classification];
+    if (decisionObj) {
+      compatResult.decision = { label: decisionObj.label, color: decisionObj.color };
+    } else if (typeof compatResult.decision !== "object" || compatResult.decision === null) {
+      compatResult.decision = { label: classification || "NEUTRAL", color: "var(--text6)" };
+    }
+    compatResult.decisionColor = decisionObj ? decisionObj.color : null;
+    compatResult._patternClassification = classification;
+    compatResult._patternWinRate = pattern.tradeStats ? pattern.tradeStats.winRate : null;
+    compatResult._patternTrades = pattern.tradeStats ? pattern.tradeStats.totalTrades : null;
+    compatResult._patternTopWeight = getTopWeight(resolveWeightsForDisplay(pattern));
+    compatResult._patternHasCalibration = !!(pattern.calibration && pattern.calibration.global);
+    compatResult._powerBonusApplied = round2(powerBonusTotal);
+    compatResult._powerBonusBreakdown = pillarBonuses;
+    // ML prediction metadata — also record WHY the blend was skipped so the
+    // UI can show a visible M— status instead of silently degrading.
+    compatResult._mlStatus = mlPrediction ? "active" : "off";
+    if (mlPrediction) {
+      compatResult._mlEnhanced = true;
+      compatResult._mlWinProb = mlPrediction.winProbability;
+      compatResult._mlRecommendation = mlPrediction.recommendation;
+    } else if (!_cachedScoringConfig.useMLBlend) {
+      compatResult._mlReason = "ML blend disabled in scoring config";
+    } else if (compatResult._mlSwallowErr) {
+      compatResult._mlReason = "ML prediction failed: " + compatResult._mlSwallowErr;
+    } else if (!_cachedMLModel || !window.MLTrainer || !window.MLTrainer.predictSync) {
+      compatResult._mlReason = "No champion ML model saved — train and save one in the ML tab";
+    } else {
+      compatResult._mlReason = "Entry score below the model's training minimum";
+    }
+
+    return compatResult;
+  }
+
+  function getTopWeight(weights) {
+    if (!weights) return null;
+    var max = 0, top = null, allEqual = true, firstW = null;
+    Object.keys(weights).forEach(function (k) {
+      var w = weights[k] != null ? weights[k] : 0;
+      if (firstW == null) firstW = w;
+      else if (Math.abs(w - firstW) > 0.001) allEqual = false;
+      if (w > max) { max = w; top = k; }
+    });
+    if (allEqual) return null;
+    return top ? { component: top, weight: max } : null;
+  }
+
+  /**
+   * Apply pattern calibration to raw probTouch value.
+   */
+  function findTercile(driftScore, stratified) {
+    if (!stratified || !stratified.length || driftScore == null) return null;
+    for (var i = 0; i < stratified.length; i++) {
+      var s = stratified[i];
+      if (s && s.driftRange) {
+        var lo = s.driftRange[0], hi = s.driftRange[1];
+        if (driftScore >= lo && driftScore <= hi) return i;
+      }
+    }
+    return driftScore < (stratified[0].driftRange ? stratified[0].driftRange[1] : 0.33) ? 0
+         : driftScore >= (stratified[stratified.length - 1].driftRange ? stratified[stratified.length - 1].driftRange[0] : 0.66) ? stratified.length - 1
+         : 1;
+  }
+
+  function applyPatternCalibration(rawProbTouch, driftScore, pattern) {
+    if (!pattern || !pattern.calibration || rawProbTouch == null) return rawProbTouch;
+
+    var cal = pattern.calibration;
+
+    if (cal.global && cal.global.calP0 != null && cal.global.calK != null) {
+      var calP0 = cal.global.calP0;
+      var calK = cal.global.calK;
+      var z = calK * (rawProbTouch - calP0);
+      var calibrated = 1 / (1 + Math.exp(-z));
+
+      if (cal.stratified && driftScore != null) {
+        var tercile = findTercile(driftScore, cal.stratified);
+        if (tercile != null && cal.stratified[tercile]) {
+          var stratum = cal.stratified[tercile];
+          var stratumWR = stratum.hitRate / 100;
+          var globalWR = 0.5;
+          if (cal.global.buckets && cal.global.buckets.length > 0) {
+            var totalHits = cal.global.buckets.reduce(function (s, b) { return s + (b.hitRate || 0) * (b.n || 0); }, 0);
+            var totalN = cal.global.buckets.reduce(function (s, b) { return s + (b.n || 0); }, 0);
+            globalWR = totalN > 0 ? totalHits / totalN / 100 : 0.5;
+          }
+          var stratAdj = stratumWR / (globalWR || 0.5);
+          calibrated = clamp(calibrated * 0.7 + (rawProbTouch * stratAdj) * 0.3, 0.01, 0.99);
+        }
+      }
+
+      return round3(calibrated);
+    }
+
+    if (cal.stratified && driftScore != null) {
+      var tercile2 = findTercile(driftScore, cal.stratified);
+      if (tercile2 != null && cal.stratified[tercile2]) {
+        var stratum2 = cal.stratified[tercile2];
+        var adjustment2 = stratum2.hitRate / 100;
+        return round3(clamp(rawProbTouch * (adjustment2 / 0.5), 0.01, 0.99));
+      }
+    }
+
+    return rawProbTouch;
+  }
+
+  /**
+   * Initialize the Pattern Intelligence system.
+   * Call this once after all modules are loaded.
+   */
+  window.initPatternIntelligence = async function () {
+    if (INITIALIZED) return;
+    INITIALIZED = true;
+
+    try {
+      // 1. Init PatternStore
+      if (window.PatternStore) {
+        await window.PatternStore.init();
+        console.log("[PatternIntel] PatternStore initialized");
+      }
+
+      // 2. Pre-load all patterns into memory (for synchronous screener access)
+      await loadPatternCache();
+
+      // 2b. Pre-load ML model for synchronous prediction in screener
+      await preloadMLModel();
+
+      // 2c. Expose direct-call helpers (applyPatternIntel, applyPatternConfCal).
+      //     Registered BEFORE DOM patching so sync screener paths always work
+      //     even if patchNavigation/patchScoring fail in a non-DOM context.
+      exposePatternHelpers();
+
+      // 3. Patch navigation to include Pattern Lab tab
+      patchNavigation();
+
+      // 4. Enhance scoring to use patterns when available
+      patchScoring();
+
+      var cacheCount = Object.keys(_patternMemoryCache).length;
+      console.log("[PatternIntel] System ready — screener will use calibrated pattern data (" + cacheCount + " patterns cached)");
+      if (cacheCount === 0) {
+        console.warn("[PatternIntel] NO PATTERNS in cache. Run batch backtest or import patterns from JSON.");
+      }
+    } catch (e) {
+      console.error("[PatternIntel] Init failed:", e);
+    }
+  };
+
+  /**
+   * Expose direct-call helpers for screener scoring paths.
+   * These are defined OUTSIDE patchScoring() so always available.
+   */
+  function exposePatternHelpers() {
+    /**
+     * Apply pattern intelligence to a compat result.
+     * Called from app-core.js screener paths.
+     */
+    window.applyPatternIntel = function (compatResult, symbol, dailyCandles) {
+      if (!compatResult || !symbol || compatResult._patternApplied) return compatResult;
+      var pattern = getPatternFromCache(symbol);
+      if (!pattern) {
+        // Even without a stored pattern, a manual override (Pattern Lab →
+        // Pattern Settings) must still re-weight the score.
+        try {
+          if (window.PatternStore && window.PatternStore.getWeightOverridesSync) {
+            var ov = window.PatternStore.getWeightOverridesSync();
+            if (ov) {
+              var ovW = ov[symbol] || ov[symbol + ".NS"] || ov[symbol + ".BO"];
+              if (ovW) pattern = { symbol: symbol, indicatorWeights: ovW, indicatorPowers: {} };
+            }
+          }
+        } catch (e) {}
+      }
+      var result = compatResult;
+      if (pattern) {
+        result = applyPatternToCompatResult(compatResult, pattern, dailyCandles);
+      }
+      try { if (window.__stoxRecordScore && result && result.finalScore != null) window.__stoxRecordScore(result.finalScore); } catch (e) {}
+      return result;
+    };
+
+    /**
+     * Apply pattern calibration to a 10-day confidence result.
+     */
+    window.applyPatternConfCal = function (confResult, symbol) {
+      if (!confResult || !symbol || confResult._patternCalibrated) return confResult;
+      var pattern = getPatternFromCache(symbol);
+      if (!pattern) return confResult;
+
+      var rawProb = confResult.confidenceLognormal != null ? confResult.confidenceLognormal / 100 : null;
+      var driftScore = confResult.components && confResult.components.driftScore != null ? confResult.components.driftScore : null;
+      if (rawProb != null) {
+        var calibrated = applyPatternCalibration(rawProb, driftScore, pattern);
+        if (calibrated != null && calibrated !== rawProb) {
+          confResult._patternCalibrated = true;
+          confResult._patternOriginalConf = confResult.confidence;
+          confResult.confidence = Math.round(calibrated * 100);
+          if (confResult.components && confResult.components.probTouch != null) {
+            confResult._patternOriginalProbTouch = confResult.components.probTouch;
+            confResult.components.probTouch = Math.round(calibrated * 100);
+          }
+          confResult.confidenceLognormal = Math.round(calibrated * 100);
+        }
+      }
+      return confResult;
+    };
+
+    console.log("[PatternIntel] Direct-call helpers exposed (window.applyPatternIntel, window.applyPatternConfCal)");
+
+    /**
+     * Reload the sync ML champion into the in-memory cache for synchronous
+     * screener prediction. Returns the loaded model (or null).
+     */
+    window.preloadPatternMLModel = preloadMLModel;
+  }
+
+  /**
+   * Add "Pattern Lab" to the app's navigation.
+   */
+  function patchNavigation() {
+    // Wait for the React app to render, then inject the new tab
+    var observer = new MutationObserver(function (mutations) {
+      mutations.forEach(function (mutation) {
+        mutation.addedNodes.forEach(function (node) {
+          if (node.nodeType === 1 && node.querySelector && node.querySelector('[data-stox-nav]')) {
+            injectPatternLabTab(node);
+            observer.disconnect();
+          }
+        });
+      });
+    });
+
+    observer.observe(document.documentElement, { childList: true, subtree: true });
+
+    // Safety timeout: disconnect observer if nav never appears (prevents memory leak)
+    setTimeout(function () {
+      observer.disconnect();
+      var nav = document.querySelector('[data-stox-nav]') || document.querySelector('nav');
+      if (nav) {
+        injectPatternLabTab(nav.closest('[class*="root"]') || document.body);
+      }
+    }, 2000);
+  }
+
+  function injectPatternLabTab(container) {
+    // We add the tab via React state if we can find the state setter
+    // This is a non-invasive approach: we just expose the dashboard component
+    // and let the user navigate to it via the settings page or a URL hash
+    console.log("[PatternIntel] PatternDashboard available at window.openPatternLab()");
+  }
+
+  /**
+   * Make Pattern Lab accessible from anywhere in the app.
+   */
+  window.openPatternLab = function () {
+    // Dispatch event to switch to Pulse page with patternlab tab
+    window.dispatchEvent(new CustomEvent("stox:navigate", { detail: { page: "watchlist", tab: "patternlab" } }));
+  };
+
+  /**
+   * Enhance the existing scoring functions to use pattern intelligence.
+   * When a pattern exists for a stock, the entry score and confidence
+   * are adjusted using stock-specific weights and calibration.
+   *
+   * NOTE: computeEntryScorePatched is DEPRECATED — the live screener uses
+   * window.applyPatternIntel / window.applyPatternConfCal instead (exposed
+   * via exposePatternHelpers). Kept here for backward compatibility only.
+   */
+  function patchScoring() {
+    if (!window.PatternScoring || !window.TechIndicators) return;
+
+    // Save original computeEntryScore
+    var originalComputeEntryScore = window.TechIndicators.computeEntryScore;
+
+    // Wrap to add pattern-aware scoring
+    window.TechIndicators.computeEntryScorePatched = async function (symbol, candles, opts) {
+      opts = opts || {};
+
+      // First compute the base score
+      var baseResult = originalComputeEntryScore(candles, opts.indexCandles);
+
+      if (!baseResult || baseResult.entry_score == null) return baseResult;
+
+      // Try pattern-enhanced scoring
+      try {
+        var enhanced = await window.PatternScoring.compute(symbol, candles, opts);
+        if (enhanced && enhanced.entryScore != null) {
+          // Merge pattern data into the result
+          baseResult.pattern_adjusted_score = enhanced.entryScore;
+          baseResult.pattern_score_delta = enhanced.scoreDelta;
+          baseResult.pattern_confidence = enhanced.confidence;
+          baseResult.pattern_probTouch = enhanced.probTouch;
+          baseResult.pattern_used = enhanced.patternUsed;
+          baseResult.classification = enhanced.classification;
+        }
+      } catch (e) {
+        // Pattern scoring failed — use base result
+        console.warn("[PatternIntel] Scoring fallback:", e.message);
+      }
+
+      return baseResult;
+    };
+
+    // Quick check for pattern availability (async — for non-screener use)
+    window.TechIndicators.hasPattern = async function (symbol) {
+      if (!window.PatternStore) return false;
+      var pattern = await window.PatternStore.get(symbol);
+      return pattern != null;
+    };
+
+    // Synchronous check using in-memory cache (for screener badge counting)
+    window.TechIndicators.hasPatternSync = function (symbol) {
+      return getPatternFromCache(symbol) != null;
+    };
+
+    console.log("[PatternIntel] Scoring patched with pattern intelligence");
+  }
+
+  /**
+   * Utility: Run batch backtest for all stocks and return results.
+   * Can be called from the browser console:
+   *   await runFullBatchBacktest()
+   */
+  window.runFullBatchBacktest = async function (symbols) {
+    if (!window.BatchBacktest) {
+      throw new Error("BatchBacktest module not loaded");
+    }
+
+    var stocks = symbols || (window.NIFTY_200 && window.NIFTY_200.map ? window.NIFTY_200.map(function(s) { return s.t; }) : null) || getDefaultStocks();
+    var _sc = (window.TechIndicators && window.TechIndicators.getScoreConfig) ? window.TechIndicators.getScoreConfig() : {};
+    var runner = window.BatchBacktest.create({
+      targetProfitPct: (window.TechIndicators && window.TechIndicators.getTargetPctDisplay) ? window.TechIndicators.getTargetPctDisplay() : 3.5,
+      holdingPeriodDays: _sc.horizonDays || 15,
+      threshold: 65,
+      sampleEvery: 2
+    });
+
+    console.log("[PatternIntel] Starting batch backtest for " + stocks.length + " stocks...");
+
+    var result = await runner.runBatch(stocks, {
+      onProgress: function (current, total, symbol, phase) {
+        if (current % 10 === 0 || phase === "done") {
+          console.log("[BatchBT] " + current + "/" + total + " " + symbol + " — " + phase);
+        }
+      }
+    });
+
+    console.log("[PatternIntel] Batch complete:", result.summary);
+    // Reload screener's in-memory pattern cache with new patterns
+    if (window.reloadPatternCache) await window.reloadPatternCache();
+    return result;
+  };
+
+  /**
+   * Utility: Refresh stale patterns (older than 7 days).
+   */
+  window.refreshStalePatterns = async function (symbols) {
+    if (!window.BatchBacktest || !window.PatternStore) {
+      throw new Error("BatchBacktest and PatternStore required");
+    }
+
+    var _sc2 = (window.TechIndicators && window.TechIndicators.getScoreConfig) ? window.TechIndicators.getScoreConfig() : {};
+    var runner = window.BatchBacktest.create({
+      targetProfitPct: (window.TechIndicators && window.TechIndicators.getTargetPctDisplay) ? window.TechIndicators.getTargetPctDisplay() : 3.5,
+      holdingPeriodDays: _sc2.horizonDays || 15,
+      threshold: 65,
+      sampleEvery: 2
+    });
+
+    var result = await runner.refreshStale(symbols, 7 * 24 * 60 * 60 * 1000);
+    console.log("[PatternIntel] Refresh complete:", result);
+    // Reload screener's in-memory pattern cache with refreshed patterns
+    if (window.reloadPatternCache) await window.reloadPatternCache();
+    return result;
+  };
+
+  /**
+   * Utility: Train ML model on stored features (legacy — single split).
+   */
+  window.trainMLModel = async function (config) {
+    if (!window.MLTrainer) {
+      throw new Error("MLTrainer module not loaded");
+    }
+
+    var trainer = window.MLTrainer.create(config || {
+      hiddenUnits: [32, 16],
+      learningRate: 0.01,
+      epochs: 50,
+      batchSize: 32
+    });
+
+    console.log("[PatternIntel] Starting ML training...");
+
+    var result = await trainer.train({
+      onEpoch: function (epoch, loss, trainAcc, valAcc) {
+        if (epoch % 10 === 0) {
+          console.log("[ML] Epoch " + epoch + ": loss=" + loss.toFixed(4) + " train=" + trainAcc + "% val=" + valAcc + "%");
+        }
+      }
+    });
+
+    console.log("[PatternIntel] ML training complete:", result);
+    return result;
+  };
+
+  /**
+   * Utility: Train ML model with walk-forward validation (recommended).
+   * Trains, validates across time-based folds, and auto-promotes if better.
+   */
+  window.trainMLModelWalkForward = async function (config) {
+    if (!window.MLTrainer) {
+      throw new Error("MLTrainer module not loaded");
+    }
+
+    console.log("[PatternIntel] Starting walk-forward ML training...");
+
+    var result = await window.MLTrainer.trainWithWalkForward(Object.assign({}, config || {}, {
+      numFolds: (config && config.numFolds) || 5,
+      epochsPerFold: (config && config.epochsPerFold) || 30,
+      hiddenUnits: (config && config.hiddenUnits) || [32, 16],
+      learningRate: (config && config.learningRate) || 0.005,
+      onFold: function (fold, total, foldResult) {
+        if (foldResult.skipped) {
+          console.log("[ML-WF] Fold " + fold + "/" + total + " skipped: " + foldResult.reason);
+        } else {
+          console.log("[ML-WF] Fold " + fold + "/" + total + ": valAcc=" + foldResult.finalValAcc + "%, F1=" + foldResult.f1);
+        }
+      }
+    }));
+
+    console.log("[PatternIntel] Walk-forward training complete:", result.walkForwardAcc + "% avg accuracy");
+    if (result.promotion) {
+      console.log("[PatternIntel] Promotion: " + result.promotion.reason);
+    }
+    return result;
+  };
+
+  /**
+   * Utility: Continuous retrain with drift detection.
+   * Call after batch backtest runs to keep model fresh.
+   */
+  window.continuousMLRetrain = async function (config) {
+    if (!window.MLTrainer) {
+      throw new Error("MLTrainer module not loaded");
+    }
+
+    console.log("[PatternIntel] Starting continuous ML retrain...");
+    var result = await window.MLTrainer.continuousRetrain(Object.assign({}, config || {}, {
+      onProgress: function (current, total, msg) {
+        console.log("[ML-RETRAIN] " + (total > 0 ? Math.round(current / total * 100) : 0) + "% — " + msg);
+      }
+    }));
+
+    console.log("[PatternIntel] Continuous retrain result:", result.retrained ? "retrained" : "skipped");
+    if (result.drift) {
+      console.log("[PatternIntel] Drift status:", result.drift.reason);
+    }
+    return result;
+  };
+
+  /**
+   * Utility: Optimize backtest config params using Bayesian optimization.
+   */
+  window.optimizeBacktestConfig = async function (config) {
+    if (!window.MLOptimizer) {
+      throw new Error("MLOptimizer module not loaded");
+    }
+
+    console.log("[PatternIntel] Starting Bayesian config optimization...");
+    var result = await window.MLOptimizer.optimizeConfig(config);
+    console.log("[PatternIntel] Optimization complete. Best config:", JSON.stringify(result.bestConfig));
+    return result;
+  };
+
+  /**
+   * Utility: Detect current market regime.
+   */
+  window.detectMarketRegime = async function (candles, indexCandles) {
+    if (!window.MLOptimizer) return null;
+    return window.MLOptimizer.detectRegimeFromCandles(candles, indexCandles);
+  };
+
+  /**
+   * Utility: Get ML model status (versions, champion, drift, retrain history).
+   */
+  window.getMLStatus = async function () {
+    if (window.MLTrainer) {
+      return await window.MLTrainer.getModelStatus();
+    }
+    return null;
+  };
+
+  /**
+   * Utility: Get pattern summary for a stock.
+   */
+  window.getPatternInfo = async function (symbol) {
+    if (!window.PatternScoring) return null;
+    return await window.PatternScoring.getPatternSummary(symbol);
+  };
+
+  /**
+   * Default stock list if none provided.
+   */
+  function getDefaultStocks() {
+    return [
+      "RELIANCE","TCS","HDFCBANK","INFY","ICICIBANK","HINDUNILVR","SBIN","BHARTIARTL",
+      "ITC","KOTAKBANK","LT","AXISBANK","ASIANPAINT","BAJFINANCE","MARUTI","HCLTECH",
+      "SUNPHARMA","TITAN","WIPRO","ULTRACEMCO","NESTLEIND","NTPC","POWERGRID","ONGC",
+      "TATAMOTORS","JSWSTEEL","ADANIENT","HINDALCO","COALINDIA","BAJAJFINSV",
+      "INDUSINDBK","DRREDDY","CIPLA","TECHM","GRASIM","HDFCLIFE","DIVISLAB",
+      "EICHERMOT","BPCL","BRITANNIA","IOC","SHRIRAMFIN","HEROMOTOCO","M_M",
+      "PIDILITIND","ABB","ACC","AMBUJACEM","DIXON","LAURUSLABS","TORNTPHARM",
+      "VBL","DALBHARAT","LTI","YESBANK","IDFCFIRSTB","TATAPOWER","INDIGO",
+      "VEDL","NMDC","UPL","MUTHOOTFIN","SRF","BERGEPAINT","GODREJCP",
+      "PEL","COLPAL","HAVELLS","DABUR","MARICO","PAGEIND","TRENT","UBL",
+      "CHOLAHLDG","BANDHANBNK","PFC","REC","MANAPPURAM"
+    ];
+  }
+
+  // Auto-init when DOM is ready
+  // Direct-call helpers (window.applyPatternIntel, window.applyPatternConfCal)
+  // are registered immediately, before DOM patching, so the sync screener ML
+  // blend always works even if patchNavigation/patchScoring fail in a
+  // non-DOM context.
+  try { exposePatternHelpers(); } catch (e) {}
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", function () {
+      setTimeout(function () { window.initPatternIntelligence(); }, 500);
+    });
+  } else {
+    setTimeout(function () { window.initPatternIntelligence(); }, 500);
+  }
+
+})();
